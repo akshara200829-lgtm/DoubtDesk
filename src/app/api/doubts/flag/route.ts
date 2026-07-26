@@ -58,25 +58,36 @@ export async function POST(req: NextRequest) {
                 sql`SELECT ${doubtsTable.id} FROM ${doubtsTable} WHERE ${doubtsTable.id} = ${doubtId} FOR UPDATE`,
             );
 
-        let autoHidden = false;
-        if (recentFlagCount >= AUTO_HIDE_FLAG_THRESHOLD) {
-            await db.update(doubtsTable).set({ isHidden: true }).where(eq(doubtsTable.id, doubtId));
-            autoHidden = true;
+            if (!locked.rows?.length) return;
 
-            if (doubt.classroomId) {
-                // Best-effort: the flag insert and auto-hide update have already
-                // committed above, so a notification-dispatch failure shouldn't
-                // turn this into an error response for the client.
-                try {
-                    await inngest.send({
-                        name: "doubt/auto-hidden",
-                        data: { doubtId, classroomId: doubt.classroomId },
-                    });
-                } catch (error) {
-                    console.error("Failed to send doubt/auto-hidden event", error);
+            const windowStart = new Date(Date.now() - AUTO_HIDE_WINDOW_MS);
+            const [{ value: recentFlagCount }] = await tx
+                .select({ value: count() })
+                .from(contentFlagsTable)
+                .where(
+                    and(
+                        eq(contentFlagsTable.doubtId, doubtId),
+                        eq(contentFlagsTable.status, "open"),
+                        gte(contentFlagsTable.createdAt, windowStart),
+                    ),
+                );
+
+            if (recentFlagCount >= AUTO_HIDE_FLAG_THRESHOLD) {
+                await tx.update(doubtsTable).set({ isHidden: true }).where(eq(doubtsTable.id, doubtId));
+                autoHidden = true;
+
+                if (doubt.classroomId) {
+                    try {
+                        await inngest.send({
+                            name: "doubt/auto-hidden",
+                            data: { doubtId, classroomId: doubt.classroomId },
+                        });
+                    } catch (error) {
+                        console.error("Failed to send doubt/auto-hidden event", error);
+                    }
                 }
             }
-        }
+        });
 
         return NextResponse.json({
             success: true,
